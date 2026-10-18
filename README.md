@@ -25,7 +25,7 @@
 
 ### 前置要求
 
-- **ScriptCat（脚本猫）**浏览器扩展 —— [官网下载](https://docs.scriptcat.org/)
+- ScriptCat（脚本猫）浏览器扩展 —— [官网下载](https://scriptcat.org/)
   > ⚠️ 必须用脚本猫。后台引擎依赖脚本猫的 `@background` 能力，Tampermonkey 不支持。
 - Chrome / Edge 等现代浏览器
 
