@@ -275,6 +275,7 @@
       const r2 = await apiPost(REPORT, rep, cKey, header);
       if (r2.code !== 200) throw Object.assign(new Error("report " + r2.code + " " + (r2.message || "")), { fatal: r2.code === 401 || r2.code === 403 });
       prog.lastWatchTime = lwt; prog.attempts = 0; prog.status = "running"; prog.err = "";
+      prog.lastTickAt = Date.now();
       if (t.duration && t.duration - lwt < 1) prog.status = "done";
     } catch (e) {
       prog.attempts = (prog.attempts || 0) + 1; prog.err = e.message;
@@ -299,7 +300,19 @@
     let ticked = 0;
     for (const t of active.slice(0, Math.max(1, set.concurrency || 2))) {
       const p = progAll[t.id] || (progAll[t.id] = { lastWatchTime: t.lastWatchTime || 0, fresh: true, status: "queued", attempts: 0, nextTickAt: now + rnd(800, 9000) });
-      if (now >= p.nextTickAt) { p.nextTickAt = now + 10000 + rnd(0, 1200); ticked++; tickTask(t, p, cKey); }
+      if (now >= p.nextTickAt) {
+        // 补拍：本页被后台节流/冻结期间错过的窗口，一次唤醒补上（封顶 6 个防请求风暴）
+        const due = Math.min(6, 1 + Math.floor((now - p.nextTickAt) / 10000));
+        p.nextTickAt = now + 10000 + rnd(0, 1200);
+        ticked++;
+        (async () => {
+          for (let i = 0; i < due; i++) {
+            if (i) await new Promise(r => setTimeout(r, rnd(400, 1500)));
+            await tickTask(t, p, cKey);
+            if (p.status === "error") break;
+          }
+        })();
+      }
     }
     for (const id of Object.keys(progAll)) if (!tasks.find(t => t.id === id)) delete progAll[id];
     if (ticked || stored.lastDriver !== MY_ID) { state.lastDriver = MY_ID; state.lastTickAt = now; state.lastTickCount = ticked; }
@@ -563,13 +576,18 @@
   }
 
   // ================= 主循环：渲染 + 回退引擎接管 =================
-  let cKey = null;
+  let cKey = null, cKeyTryAt = 0;
   (async () => {
     cKey = await refreshCKey();
     setInterval(() => {
       render();
+      // cKey 刷新失败时每 15 秒自动重试
+      if (!cKey) {
+        if (Date.now() - cKeyTryAt > 15000) { cKeyTryAt = Date.now(); refreshCKey().then(k => { cKey = k; }).catch(() => {}); }
+        return;
+      }
       const state = getJ(K_STATE, {});
-      if (!cKey || state.masterPaused) return;
+      if (state.masterPaused) return;
       const now = Date.now();
       // 本页就是驱动者，或现任驱动者 12 秒无产出 → 接管
       if (state.lastDriver === MY_ID || now - (state.lastTickAt || 0) > 12000) loopOnce(cKey);

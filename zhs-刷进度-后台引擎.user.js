@@ -179,6 +179,7 @@
       const r2 = await postEnc(REPORT, rep, cKey, header, prog.useCookie ? GM_getValue("zhs_cookie") : "");
       if (!r2.ok) throw Object.assign(new Error("report http=" + r2.status + " code=" + r2.code), { fatal: r2.status === 401 || r2.status === 403 || r2.code === 401 || r2.code === 403 });
       prog.lastWatchTime = lwt;
+      prog.lastTickAt = Date.now(); // 供补拍计算：距上次成功 tick 的真实间隔
       prog.attempts = 0; prog.status = "running"; prog.err = "";
       if (t.duration && lwt >= t.duration - 1.5) prog.status = "done";
     } catch (e) {
@@ -209,9 +210,17 @@
     for (const t of active.slice(0, Math.max(1, settings.concurrency || 2))) {
       const p = progAll[t.id] || (progAll[t.id] = { lastWatchTime: t.lastWatchTime || 0, fresh: true, status: "queued", attempts: 0, nextTickAt: now + rnd(800, 9000) });
       if (now >= p.nextTickAt) {
+        // 补拍：SW 被挂起/页面被节流期间错过的窗口，一次唤醒补上（封顶 6 个防请求风暴）
+        const due = Math.min(6, 1 + Math.floor((now - p.nextTickAt) / 10000));
         p.nextTickAt = now + 10000 + rnd(0, 1200); // 先占位再发送，防重
         ticked++;
-        tickTask(t, p, cKey);
+        (async () => {
+          for (let i = 0; i < due; i++) {
+            if (i) await new Promise(r => setTimeout(r, rnd(400, 1500))); // 补拍窗口间留点间隔
+            await tickTask(t, p, cKey);
+            if (p.status === "error") break; // 失败（如401）立即停止本轮补拍
+          }
+        })();
       }
     }
     // 清理已删除任务的进度
@@ -224,21 +233,34 @@
     setJ(K_STATE, state);
   }
 
-  let cKey = null, booted = false;
-  async function boot() {
-    if (booted) return;
-    booted = true;
-    cKey = await refreshCKey();
-    GM_log("后台引擎启动 " + MY_ID, "info");
-    loopOnce(cKey); // 启动即扫一次队列（service worker 被挂起后唤醒时立即补上到期 tick）
-    setInterval(() => { if (cKey) loopOnce(cKey); }, 1000);
+  let cKey = null, booting = null;
+  function boot() {
+    if (cKey) return Promise.resolve();
+    if (!booting) {
+      // 可重试启动：失败不清空重试资格，闹钟/重试间隔会再次尝试
+      booting = refreshCKey()
+        .then(k => {
+          cKey = k;
+          GM_log("后台引擎启动 " + MY_ID, "info");
+          if (!boot._loop) {
+            boot._loop = 1;
+            setInterval(() => { if (cKey) loopOnce(cKey); }, 1000);
+          }
+          loopOnce(cKey); // 启动即扫一次队列（SW 被挂起后唤醒时立即补上到期 tick）
+        })
+        .catch(e => { GM_log("启动失败（将自动重试）: " + (e && e.message || e), "warn"); })
+        .finally(() => { booting = null; });
+    }
+    return booting;
   }
   // MV3 service worker 会被挂起：顶层注册闹钟，挂起期间靠闹钟唤醒补 tick
   try {
     chrome.alarms.create("zhs-tick", { periodInMinutes: 0.5 });
     chrome.alarms.onAlarm.addListener(al => {
-      if (al && al.name === "zhs-tick") { if (!cKey) boot(); else loopOnce(cKey); }
+      if (al && al.name === "zhs-tick") boot().then(() => { if (cKey) loopOnce(cKey); });
     });
   } catch (e) { GM_log("alarms 不可用: " + e.message, "warn"); }
+  // 15 秒兜底重试（cKey 刷新失败时自动再试，直到成功）
+  setInterval(() => { if (!cKey) boot(); }, 15000);
   boot();
 })();
